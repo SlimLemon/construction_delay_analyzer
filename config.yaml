@@ -1,0 +1,41 @@
+
+# Configuration for Construction Schedule Delay Analyzer
+
+# Analysis Parameters
+analysis:
+  critical_path_threshold: 0  # Total Float <= this value
+  near_critical_threshold: 5  # Days of float for near-critical activities
+  significant_delay_threshold: 5  # Days to flag as significant delay
+  
+# Forensic Window Settings
+forensic_windows:
+  default_period: "monthly"  # monthly, quarterly, custom
+  custom_period_days: 30
+  overlap_days: 0
+  
+# Report Settings
+reports:
+  company_name: "Your Company Name"
+  logo_path: ""  # Path to company logo
+  include_charts: true
+  include_detailed_activities: true
+  max_activities_in_report: 1000
+  
+# Critical Path Settings
+critical_path:
+  show_predecessors: true
+  show_successors: true
+  max_chain_length: 50
+  
+# Export Settings
+export:
+  pdf_page_size: "letter"  # letter, a4
+  excel_freeze_panes: true
+  include_filters: true
+  
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  file: "logs/analyzer.log"
+  max_bytes: 10485760  # 10MB
+  backup_count: 5
