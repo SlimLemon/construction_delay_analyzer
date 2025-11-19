@@ -1,185 +1,258 @@
 # api.py
 from __future__ import annotations
 
-from dataclasses import asdict
-from typing import List, BinaryIO, Literal, Dict, Any
+import os
+import tempfile
+from datetime import datetime
+from typing import Dict, List, Any, Literal
 
 from analysis_engine import AnalysisEngine
-from forensic_windows import ForensicWindowAnalyzer
+from forensic_windows import ForensicWindowAnalyzer, ForensicWindow
 from report_generator import ReportGenerator
-from models import ComparisonResult, ForensicWindow, DelayEvent
+from models import ComparisonResult, DelayEvent, Schedule
 
-
-AnalysisMethod = Literal["TIA"]
 WindowMode = Literal["baseline_range", "updates_range"]
 
 
-def _filelike_to_bytes(file_obj: BinaryIO) -> bytes:
-    """Streamlit uploads give you a file-like object; convert to bytes once."""
-    file_obj.seek(0)
-    return file_obj.read()
+def _save_uploaded_file(uploaded_file) -> str:
+    """
+    Persist a Streamlit UploadedFile to a temp file and return its path.
+    """
+    suffix = os.path.splitext(uploaded_file.name)[1] or ".xer"
+    fd, temp_path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    with open(temp_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return temp_path
 
 
-def run_tia_analysis(
+def _default_config() -> Dict:
+    """
+    Minimal default config so AnalysisEngine / ForensicWindowAnalyzer / ReportGenerator
+    all initialize cleanly.
+    """
+    return {
+        "analysis": {
+            "critical_path_threshold": 0,
+            "significant_delay_threshold": 5,
+        },
+        "reports": {
+            "company_name": "Construction Delay Analyzer",
+        },
+    }
+
+
+def run_tia_with_windows(
     baseline_file,
     update_files: List,
     window_mode: WindowMode,
     generate_pdf: bool = False,
+    config: Dict | None = None,
 ) -> Dict[str, Any]:
     """
-    High-level orchestration for:
-    - 1 baseline XER
-    - 1+ update XER
-    - TIA-style analysis with automatic windowing
-    - Excel output (+ optional PDF)
-    
-    Returns:
+    End-to-end orchestration for the Streamlit UI.
+
+    Inputs:
+      - baseline_file: Streamlit UploadedFile (.xer)
+      - update_files: list[UploadedFile] (.xer)
+      - window_mode: "baseline_range" or "updates_range"
+      - generate_pdf: whether to also produce a PDF report
+      - config: optional config dict for analysis/reporting
+
+    Returns a dict:
       {
         "summary": {...},
         "window_summaries": [...],
-        "excel_path": "path/to.xlsx",
-        "pdf_path": "path/to.pdf" or None,
+        "excel_path": str,
+        "pdf_path": Optional[str],
     }
     """
-
     if not update_files:
-        raise ValueError("At least one update schedule is required for TIA analysis.")
+        raise ValueError("At least one update schedule is required.")
 
-    engine = AnalysisEngine()
+    if config is None:
+        config = _default_config()
 
-    # 1) Parse baseline and updates
-    baseline_bytes = _filelike_to_bytes(baseline_file)
-    update_bytes_list = [_filelike_to_bytes(f) for f in update_files]
+    # --- 1. Initialize core components ---
+    engine = AnalysisEngine(config=config)
+    fw_analyzer = ForensicWindowAnalyzer(config=config)
+    report_gen = ReportGenerator(config=config)
 
-    baseline_schedule = engine.parse_schedule_from_bytes(baseline_bytes)
-    update_schedules = [
-        engine.parse_schedule_from_bytes(b) for b in update_bytes_list
-    ]
+    # --- 2. Save uploaded files to temp paths ---
+    baseline_path = _save_uploaded_file(baseline_file)
+    update_paths = [_save_uploaded_file(f) for f in update_files]
 
-    # 2) Validate schedules (if your engine exposes validation)
-    validation_issues = engine.validate_schedules(
-        baseline_schedule,
-        update_schedules,
+    # --- 3. Parse baseline and LAST update into engine for global comparison ---
+    baseline_schedule: Schedule = engine.parse_xer_file(
+        baseline_path,
+        schedule_type="baseline",
+    )
+    current_schedule: Schedule = engine.parse_xer_file(
+        update_paths[-1],
+        schedule_type="current",
     )
 
-    # 3) Comparison – baseline vs last update for overall snapshot
-    comparator = engine.get_comparator()
-    comparison_result: ComparisonResult = comparator.compare(
-        baseline_schedule,
-        update_schedules[-1],
-    )
+    # --- 4. Compare schedules -> ComparisonResult ---
+    comparison: ComparisonResult = engine.compare_schedules()
 
-    # 4) Forensic windows – TIA with auto windowing
-    fw_analyzer = ForensicWindowAnalyzer()
+    # --- 5. Identify delay events & concurrent delays (for responsibility stats) ---
+    delay_events: List[DelayEvent] = engine.identify_delay_events(comparison)
+    _ = engine.identify_concurrent_delays(delay_events)  # marks .is_concurrent in-place
+
+    # --- 6. Build forensic windows across ALL updates ---
+    #    Need each update as a Schedule, not just the last one
+    update_schedules: List[Schedule] = []
+    for path in update_paths:
+        sched = engine.parse_xer_file(path, schedule_type="current")
+        update_schedules.append(sched)
+
+    # Decide the date range for windows
+    start_date = baseline_schedule.start_date
+    # end_date = last update finish
+    end_date = update_schedules[-1].finish_date
 
     if window_mode == "baseline_range":
-        # windows from baseline start to last update finish
-        windows: List[ForensicWindow] = fw_analyzer.create_tia_windows_from_baseline_range(
-            baseline_schedule,
-            update_schedules,
+        # Monthly windows from baseline start to last update finish
+        windows: List[ForensicWindow] = fw_analyzer.create_monthly_windows(
+            start_date=start_date,
+            end_date=end_date,
         )
     elif window_mode == "updates_range":
-        # windows bounded by update dates
-        windows: List[ForensicWindow] = fw_analyzer.create_tia_windows_from_updates(
-            baseline_schedule,
-            update_schedules,
+        # Custom windows bounded by update date range (roughly one window per month/period)
+        # Here we use a generic period; you can refine later if you want
+        period_days = 30
+        windows: List[ForensicWindow] = fw_analyzer.create_custom_windows(
+            start_date=start_date,
+            end_date=end_date,
+            period_days=period_days,
         )
     else:
         raise ValueError(f"Unsupported window_mode: {window_mode}")
 
-    # 5) Run TIA inside each window (if not already done inside create_* methods)
-    windows = fw_analyzer.run_tia_on_windows(
-        baseline_schedule,
-        update_schedules,
-        windows,
+    # Analyze each window using baseline vs final current for now.
+    # Later you can refine to before/after per-update if needed.
+    analyzed_windows: List[ForensicWindow] = []
+    for w in windows:
+        analyzed = fw_analyzer.analyze_window(
+            window=w,
+            baseline_schedule=baseline_schedule,
+            current_schedule=current_schedule,
+        )
+        analyzed_windows.append(analyzed)
+
+    # Compute concurrent delay groups per window (optional, but you already have it)
+    _ = fw_analyzer.analyze_concurrent_delays(analyzed_windows)
+
+    # --- 7. Export to Excel/PDF using ReportGenerator ---
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    excel_path = os.path.join(
+        tempfile.gettempdir(),
+        f"schedule_analysis_{timestamp}.xlsx",
     )
-
-    # 6) Generate reports (Excel + optional PDF)
-    report_gen = ReportGenerator()
-
-    excel_path = report_gen.generate_excel_report(
-        comparison_result=comparison_result,
-        forensic_windows=windows,
-        validation_issues=validation_issues,
-    )
-
     pdf_path = None
     if generate_pdf:
-        pdf_path = report_gen.generate_pdf_report(
-            comparison_result=comparison_result,
-            forensic_windows=windows,
-            validation_issues=validation_issues,
+        pdf_path = os.path.join(
+            tempfile.gettempdir(),
+            f"schedule_analysis_{timestamp}.pdf",
         )
 
-    # 7) Build summaries for the UI
+    # This gives you the full Excel with summary, delays, float, milestones, windows
+    report_gen.export_to_excel(
+        comparison=comparison,
+        windows=analyzed_windows,
+        output_path=excel_path,
+    )
+    if generate_pdf and pdf_path is not None:
+        report_gen.generate_pdf_report(
+            comparison=comparison,
+            windows=analyzed_windows,
+            output_path=pdf_path,
+        )
 
-    # total delays by responsibility (assuming DelayEvent has these fields)
-    owner_delay = 0
-    contractor_delay = 0
-    concurrent_delay = 0
+    # --- 8. Summaries for the UI ---
 
-    for w in windows:
-        for de in w.delay_events:  # adjust attribute name if different
+    # Responsibility buckets from delay_events (DelayEvent has responsible_party & is_concurrent)
+    owner_delay_days = 0.0
+    contractor_delay_days = 0.0
+    concurrent_delay_days = 0.0
+
+    for d in delay_events:
+        if d.is_concurrent:
+            concurrent_delay_days += d.delay_days
+        else:
+            rp = (d.responsible_party or "").upper()
+            if rp == "OWNER":
+                owner_delay_days += d.delay_days
+            elif rp == "CONTRACTOR":
+                contractor_delay_days += d.delay_days
+
+    # Critical path shifts & window classifications
+    cp_shift_count = 0
+    windows_with_owner_delay = 0
+    windows_with_contractor_delay = 0
+    windows_with_concurrent_delay = 0
+
+    window_summaries: List[Dict[str, Any]] = []
+
+    for w in analyzed_windows:
+        # count CP shifts in window
+        cp_changed = bool(
+            w.critical_path_changes.get("new_critical")
+            or w.critical_path_changes.get("removed_critical")
+        )
+        if cp_changed:
+            cp_shift_count += 1
+
+        has_owner = False
+        has_contractor = False
+        has_concurrent = False
+
+        for de in w.delays:
             if de.is_concurrent:
-                concurrent_delay += de.net_delay_days
-            elif de.responsible_party == "OWNER":
-                owner_delay += de.net_delay_days
-            elif de.responsible_party == "CONTRACTOR":
-                contractor_delay += de.net_delay_days
+                has_concurrent = True
+            rp = (de.responsible_party or "").upper()
+            if rp == "OWNER":
+                has_owner = True
+            elif rp == "CONTRACTOR":
+                has_contractor = True
 
-    # count CP shifts and windows with delays
-    cp_shift_count = sum(
-        1 for w in windows if getattr(w, "critical_path_changed", False)
-    )
+        if has_owner:
+            windows_with_owner_delay += 1
+        if has_contractor:
+            windows_with_contractor_delay += 1
+        if has_concurrent:
+            windows_with_concurrent_delay += 1
 
-    windows_with_owner = sum(
-        1 for w in windows if any(
-            (de.responsible_party == "OWNER" and not de.is_concurrent)
-            for de in w.delay_events
+        window_summaries.append(
+            {
+                "window_id": w.window_id,
+                "start": w.start_date,
+                "end": w.end_date,
+                "total_delay_days": w.get_total_delay(),
+                "num_delays": len(w.delays),
+                "num_critical_delays": len(w.get_critical_delays()),
+                "cp_changed": cp_changed,
+            }
         )
-    )
-    windows_with_contractor = sum(
-        1 for w in windows if any(
-            (de.responsible_party == "CONTRACTOR" and not de.is_concurrent)
-            for de in w.delay_events
-        )
-    )
-    windows_with_concurrent = sum(
-        1 for w in windows if any(de.is_concurrent for de in w.delay_events)
-    )
 
-    summary = {
-        "baseline_finish": comparison_result.baseline_finish,
-        "current_finish": comparison_result.current_finish,
-        "total_delay_days": comparison_result.total_delay_days,
-        "owner_delay_days": owner_delay,
-        "contractor_delay_days": contractor_delay,
-        "concurrent_delay_days": concurrent_delay,
-        "spi": comparison_result.spi_overall,
-        "num_windows": len(windows),
+    comparison_summary = {
+        "baseline_finish": comparison.baseline_schedule.finish_date,
+        "current_finish": comparison.current_schedule.finish_date,
+        "total_delay_days": comparison.overall_delay,
+        "spi": comparison.spi,
+        "completion_variance": comparison.completion_variance,
+        "owner_delay_days": owner_delay_days,
+        "contractor_delay_days": contractor_delay_days,
+        "concurrent_delay_days": concurrent_delay_days,
+        "num_windows": len(analyzed_windows),
         "cp_shift_count": cp_shift_count,
-        "windows_with_owner_delay": windows_with_owner,
-        "windows_with_contractor_delay": windows_with_contractor,
-        "windows_with_concurrent_delay": windows_with_concurrent,
-        "validation_issue_count": len(validation_issues),
+        "windows_with_owner_delay": windows_with_owner_delay,
+        "windows_with_contractor_delay": windows_with_contractor_delay,
+        "windows_with_concurrent_delay": windows_with_concurrent_delay,
     }
 
-    # optional: simple dicts for each window if you want to show them in UI
-    window_summaries = []
-    for w in windows:
-        window_summaries.append({
-            "name": w.name,
-            "start": w.start_date,
-            "end": w.end_date,
-            "net_delay_days": w.net_delay_days,
-            "owner_delay_days": w.owner_delay_days,
-            "contractor_delay_days": w.contractor_delay_days,
-            "concurrent_delay_days": w.concurrent_delay_days,
-            "critical_path_changed": getattr(w, "critical_path_changed", False),
-        })
-
     return {
-        "summary": summary,
+        "summary": comparison_summary,
         "window_summaries": window_summaries,
         "excel_path": excel_path,
         "pdf_path": pdf_path,
